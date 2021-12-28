@@ -1,0 +1,5 @@
+stressapptest (1.0.9-1kaisen) kaisen-packages; urgency=medium
+
+  * First packaging for Kaisen Linux
+
+ -- Kevin Chevreuil - Kaisen <kaisen@kaisenlinux.org>  Tue, 28 Dec 2021 04:06:51 +0100

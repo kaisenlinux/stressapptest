@@ -1,0 +1,15 @@
+Source: stressapptest
+Section: utils
+Priority: optional
+Maintainer: Kevin Chevreuil - Kaisen <kaisen@kaisenlinux.org>
+Build-Depends: debhelper-compat (= 13), dh-autoreconf, libaio-dev
+Standards-Version: 4.6.0
+Homepage: https://github.com/stressapptest/stressapptest
+Vcs-Browser: https://gitlab.com/kaisenlinux/packages/stressapptest
+Vcs-Git: https://gitlab.com/kaisenlinux/packages/stressapptest.git
+
+Package: stressapptest
+Architecture: amd64 i386
+Depends: ${shlibs:Depends},
+	 ${misc:Depends},
+Description: Stress test application for simulating high load situations
