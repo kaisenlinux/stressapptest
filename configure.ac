@@ -1,5 +1,5 @@
 AC_PREREQ(2.61)
-AC_INIT([stressapptest], [1.0.9_autoconf], [opensource@google.com])
+AC_INIT([stressapptest], [1.0.11_autoconf], [opensource@google.com])
 
 AC_ARG_WITH(static, [  --with-static            enable static linking])
 
@@ -11,31 +11,46 @@ else
   AC_MSG_NOTICE([Compiling with dynamically linked libraries.])
 fi
 
-AC_CANONICAL_HOST
+AC_ARG_WITH(cpu, [  --with-cpu            define host cpu])
+
+if test -z "$with_cpu"
+then
+  AC_CANONICAL_HOST
+else
+  host_cpu=$with_cpu
+fi
 # Checking for target cpu and setting custom configuration
 # for the different platforms
 AS_CASE(["$host_cpu"],
   [*x86_64*], [
     AC_DEFINE([STRESSAPPTEST_CPU_X86_64],[],
               [Defined if the target CPU is x86_64])
-    ], 
+    ],
   [*i686*], [
     AC_DEFINE([STRESSAPPTEST_CPU_I686],[],
               [Defined if the target CPU is i686])
-    ], 
+    ],
+  [*mips*], [
+    AC_DEFINE([STRESSAPPTEST_CPU_MIPS],[],
+              [Defined if the target CPU is MIPS])
+    ],
   [*powerpc*], [
     AC_DEFINE([STRESSAPPTEST_CPU_PPC],[],
               [Defined if the target CPU is PowerPC])
-    ], 
+    ],
   [*armv7a*], [
     AC_DEFINE([STRESSAPPTEST_CPU_ARMV7A],[],
               [Defined if the target CPU is armv7a])
-    ], 
+    ],
   [*aarch64*], [
     AC_DEFINE([STRESSAPPTEST_CPU_AARCH64],[],
               [Defined if the target CPU is aarch64])
     ],
-[AC_MSG_WARN([Unsupported CPU: $host_cpu! Try x86_64, i686, powerpc, armv7a, or aarch64])]
+  [*loongarch*], [
+    AC_DEFINE([STRESSAPPTEST_CPU_LOONGARCH],[],
+              [Defined if the target CPU is LOONGARCH])
+    ],
+[AC_MSG_WARN([Unsupported CPU: $host_cpu! Try x86_64, i686, mips, powerpc, armv7a, aarch64 or loongarch])]
 )
 
 ## The following allows like systems to share settings. This is not meant to
@@ -88,6 +103,13 @@ timestamp=$(date)
 AC_MSG_CHECKING([current timestamp])
 AC_MSG_RESULT([$timestamp])
 
+if test -n "$SOURCE_DATE_EPOCH"
+then
+  timestamp=$(date -u -d "@$SOURCE_DATE_EPOCH" 2>/dev/null || date -u -r "$SOURCE_DATE_EPOCH" 2>/dev/null || date -u)
+  username=reproducible
+  hostname=reproducible
+fi
+
 AC_DEFINE_UNQUOTED([STRESSAPPTEST_TIMESTAMP],
                    "$username @ $hostname on $timestamp",
                    [Timestamp when ./configure was executed])
@@ -100,6 +122,8 @@ AS_IF([test x"$enable_default_optimizations" != xno], [
     CXXFLAGS="$CXXFLAGS -Wreturn-type -Wunused -Wuninitialized -Wall"
     CXXFLAGS="$CXXFLAGS -O3 -funroll-all-loops  -funroll-loops -DNDEBUG"
 ])
+
+AC_SYS_LARGEFILE
 
 # Checks for header files.
 AC_HEADER_DIRENT
@@ -137,6 +161,7 @@ AC_FUNC_STRERROR_R
 AC_FUNC_VPRINTF
 AC_CHECK_FUNCS([ftruncate gettimeofday memset munmap select socket strtol strtoull])
 AC_CHECK_FUNCS([mmap64 posix_memalign rand_r sched_getaffinity])
+AC_CHECK_FUNCS([pthread_rwlockattr_setkind_np])
 
 AC_CONFIG_FILES([Makefile src/Makefile])
 AC_OUTPUT

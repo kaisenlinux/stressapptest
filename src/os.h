@@ -19,7 +19,9 @@
 #include <dirent.h>
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <stdint.h>
 
+#include <cstdint>
 #include <string>
 #include <list>
 #include <map>
@@ -30,6 +32,14 @@
 #include "adler32memcpy.h"  // NOLINT
 #include "sattypes.h"       // NOLINT
 #include "clock.h"          // NOLINT
+
+#if defined(STRESSAPPTEST_CPU_X86_64) || defined(STRESSAPPTEST_CPU_I686)
+#include <immintrin.h>
+#include <x86intrin.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+#endif
 
 const char kPagemapPath[] = "/proc/self/pagemap";
 
@@ -150,9 +160,11 @@ class OsLayer {
     // to be ordered by any other fencing, serializing or other CLFLUSH
     // instruction. For example, software can use an MFENCE instruction to
     // insure that previous stores are included in the write-back.
-    asm volatile("mfence");
-    asm volatile("clflush (%0)" : : "r" (vaddr));
-    asm volatile("mfence");
+    _mm_mfence();
+    _mm_clflush(vaddr);
+    _mm_mfence();
+#elif defined(STRESSAPPTEST_CPU_MIPS)
+    syscall(__NR_cacheflush, vaddr, 32, 0);
 #elif defined(STRESSAPPTEST_CPU_ARMV7A)
     // ARMv7a cachelines are 8 words (32 bytes).
     syscall(__ARM_NR_cacheflush, vaddr, reinterpret_cast<char*>(vaddr) + 32, 0);
@@ -162,6 +174,9 @@ class OsLayer {
     asm volatile("ic ivau, %0" : : "r" (vaddr));
     asm volatile("dsb ish");
     asm volatile("isb");
+#elif defined(STRESSAPPTEST_CPU_LOONGARCH)
+    // Reference linux kernel: arch/loongarch/mm/cache.c
+    asm volatile("ibar 0");
 #else
   #warning "Unsupported CPU type: Unable to force cache flushes."
 #endif
@@ -187,12 +202,13 @@ class OsLayer {
     // to be ordered by any other fencing, serializing or other CLFLUSH
     // instruction. For example, software can use an MFENCE instruction to
     // insure that previous stores are included in the write-back.
-    asm volatile("mfence");
+    _mm_mfence();
     while (*vaddrs) {
-      asm volatile("clflush (%0)" : : "r" (*vaddrs++));
+      _mm_clflush(*vaddrs++);
     }
-    asm volatile("mfence");
-#elif defined(STRESSAPPTEST_CPU_ARMV7A) || defined(STRESSAPPTEST_CPU_AARCH64)
+    _mm_mfence();
+#elif defined(STRESSAPPTEST_CPU_MIPS) || defined(STRESSAPPTEST_CPU_ARMV7A) || \
+      defined(STRESSAPPTEST_CPU_AARCH64) || defined(STRESSAPPTEST_CPU_LOONGARCH)
     while (*vaddrs) {
       FastFlush(*vaddrs++);
     }
@@ -216,8 +232,9 @@ class OsLayer {
     // to be ordered by any other fencing, serializing or other CLFLUSH
     // instruction. For example, software can use an MFENCE instruction to
     // insure that previous stores are included in the write-back.
-    asm volatile("clflush (%0)" : : "r" (vaddr));
-#elif defined(STRESSAPPTEST_CPU_ARMV7A) || defined(STRESSAPPTEST_CPU_AARCH64)
+    _mm_clflush(vaddr);
+#elif defined(STRESSAPPTEST_CPU_MIPS) || defined(STRESSAPPTEST_CPU_ARMV7A) || \
+      defined(STRESSAPPTEST_CPU_AARCH64) || defined(STRESSAPPTEST_CPU_LOONGARCH)
     FastFlush(vaddr);
 #else
     #warning "Unsupported CPU type: Unable to force cache flushes."
@@ -241,8 +258,9 @@ class OsLayer {
     // to be ordered by any other fencing, serializing or other CLFLUSH
     // instruction. For example, software can use an MFENCE instruction to
     // insure that previous stores are included in the write-back.
-    asm volatile("mfence");
-#elif defined(STRESSAPPTEST_CPU_ARMV7A) || defined(STRESSAPPTEST_CPU_AARCH64)
+    _mm_mfence();
+#elif defined(STRESSAPPTEST_CPU_MIPS) || defined(STRESSAPPTEST_CPU_ARMV7A) || \
+      defined(STRESSAPPTEST_CPU_AARCH64) || defined(STRESSAPPTEST_CPU_LOONGARCH)
     // This is a NOP, FastFlushHint() always does a full flush, so there's
     // nothing to do for FastFlushSync().
 #else
@@ -269,14 +287,23 @@ class OsLayer {
 
     tsc = (static_cast<uint64>(tbu) << 32) | static_cast<uint64>(tbl);
 #elif defined(STRESSAPPTEST_CPU_X86_64) || defined(STRESSAPPTEST_CPU_I686)
-    datacast_t data;
-    __asm __volatile("rdtsc" : "=a" (data.l32.l), "=d"(data.l32.h));
-    tsc = data.l64;
+    tsc = __rdtsc();
+#elif defined(STRESSAPPTEST_CPU_MIPS)
+    __asm __volatile("rdhwr  %0, $2\n" : "=r" (tsc));
 #elif defined(STRESSAPPTEST_CPU_ARMV7A)
     #warning "Unsupported CPU type ARMV7A: your timer may not function correctly"
     tsc = 0;
 #elif defined(STRESSAPPTEST_CPU_AARCH64)
     __asm __volatile("mrs %0, CNTVCT_EL0" : "=r" (tsc) : : );
+#elif defined(STRESSAPPTEST_CPU_LOONGARCH)
+#if defined(__loongarch64)
+    __asm __volatile("rdtime.d %0, $r0\n" : "=r" (tsc));
+#else
+    uint64 ltsc, htsc;
+    __asm __volatile("rdtimel.w %0, $r0\n" : "=r" (ltsc));
+    __asm __volatile("rdtimeh.w %0, $r0\n" : "=r" (htsc));
+    tsc = ltsc | (htsc << 32);
+#endif
 #else
     #warning "Unsupported CPU type: your timer may not function correctly"
     tsc = 0;
@@ -345,6 +372,7 @@ class OsLayer {
   virtual bool AdlerMemcpyWarm(uint64 *dstmem, uint64 *srcmem,
                                unsigned int size_in_bytes,
                                AdlerChecksum *checksum);
+  bool has_vector() const { return has_vector_; }
 
   // Store a callback to use to print
   // app-specific info about the last error location.

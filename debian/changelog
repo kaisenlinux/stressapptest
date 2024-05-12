@@ -1,3 +1,9 @@
+stressapptest (1.0.11-1kaisen) kaisen-packages; urgency=medium
+
+  * Import the 1.0.11 release
+
+ -- Kevin Chevreuil - Kaisen <kaisen@kaisenlinux.org>  Fri, 10 May 2024 01:40:17 +0200
+
 stressapptest (1.0.9-1kaisen) kaisen-packages; urgency=medium
 
   * First packaging for Kaisen Linux

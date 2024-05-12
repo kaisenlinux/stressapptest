@@ -722,6 +722,7 @@ Sat::Sat() {
   disk_threads_ = 0;
   total_threads_ = 0;
 
+  use_affinity_ = true;
   region_mask_ = 0;
   region_count_ = 0;
   for (int i = 0; i < 32; i++) {
@@ -867,6 +868,7 @@ bool Sat::ParseArgs(int argc, char **argv) {
     ARG_IVALUE("--filesize", filesize);
 
     // NUMA options.
+    ARG_KVALUE("--no_affinity", use_affinity_, false);
     ARG_KVALUE("--local_numa", region_mode_, kLocalNuma);
     ARG_KVALUE("--remote_numa", region_mode_, kRemoteNuma);
 
@@ -1155,6 +1157,7 @@ void Sat::PrintHelp() {
          " --paddr_base     allocate memory starting from this address\n"
          " --pause_delay    delay (in seconds) between power spikes\n"
          " --pause_duration duration (in seconds) of each pause\n"
+         " --no_affinity    do not set any cpu affinity\n"
          " --local_numa     choose memory regions associated with "
          "each CPU to be tested by that CPU\n"
          " --remote_numa    choose memory regions not associated with "
@@ -1389,7 +1392,6 @@ void Sat::InitializeThreads() {
       thread->set_cpu_mask_to_cpu(nthbit);
     }
 
-
     cpu_vector->insert(cpu_vector->end(), thread);
   }
   workers_map_.insert(make_pair(kCPUType, cpu_vector));
@@ -1482,15 +1484,47 @@ int Sat::CpuCount() {
   return sysconf(_SC_NPROCESSORS_CONF);
 }
 
+int Sat::ReadInt(const char *filename, int *value) {
+  char line[64];
+  int fd = open(filename, O_RDONLY), err = -1;
+
+  if (fd < 0)
+    return -1;
+  if (read(fd, line, sizeof(line)) > 0) {
+    *value = atoi(line);
+    err = 0;
+  }
+
+  close(fd);
+  return err;
+}
+
 // Return the worst case (largest) cache line size of the various levels of
 // cache actually prsent in the machine.
 int Sat::CacheLineSize() {
-  int max_linesize = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
-  int linesize = sysconf(_SC_LEVEL2_CACHE_LINESIZE);
+  int max_linesize, linesize;
+#ifdef _SC_LEVEL1_DCACHE_LINESIZE
+  max_linesize = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
+#else
+  ReadInt("/sys/devices/system/cpu/cpu0/cache/index0/coherency_line_size", &max_linesize);
+#endif
+#ifdef _SC_LEVEL2_DCACHE_LINESIZE
+  linesize = sysconf(_SC_LEVEL2_DCACHE_LINESIZE);
+#else
+  ReadInt("/sys/devices/system/cpu/cpu0/cache/index1/coherency_line_size", &linesize);
+#endif
   if (linesize > max_linesize) max_linesize = linesize;
-  linesize = sysconf(_SC_LEVEL3_CACHE_LINESIZE);
+#ifdef _SC_LEVEL3_DCACHE_LINESIZE
+  linesize = sysconf(_SC_LEVEL3_DCACHE_LINESIZE);
+#else
+  ReadInt("/sys/devices/system/cpu/cpu0/cache/index2/coherency_line_size", &linesize);
+#endif
   if (linesize > max_linesize) max_linesize = linesize;
-  linesize = sysconf(_SC_LEVEL4_CACHE_LINESIZE);
+#ifdef _SC_LEVEL4_DCACHE_LINESIZE
+  linesize = sysconf(_SC_LEVEL4_DCACHE_LINESIZE);
+#else
+  ReadInt("/sys/devices/system/cpu/cpu0/cache/index3/coherency_line_size", &linesize);
+#endif
   if (linesize > max_linesize) max_linesize = linesize;
   return max_linesize;
 }

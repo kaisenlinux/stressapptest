@@ -30,7 +30,9 @@
 #include "stressapptest_config_android.h"  // NOLINT
 #else
 #include "stressapptest_config.h"  // NOLINT
+#ifndef _LIBCPP_VERSION
 using namespace __gnu_cxx;  //NOLINT
+#endif  // _LIBCPP_VERSION
 #endif  // __ANDROID__
 using namespace std;
 
@@ -223,15 +225,25 @@ inline void cpuid(
     : "a" (*eax)
   );  // Asm
 #endif  // defined(__PIC__) && defined(STRESSAPPTEST_CPU_I686)
+#elif defined(STRESSAPPTEST_CPU_MIPS)
+  return;
 #elif defined(STRESSAPPTEST_CPU_PPC)
   return;
 #elif defined(STRESSAPPTEST_CPU_ARMV7A)
   return;
 #elif defined(STRESSAPPTEST_CPU_AARCH64)
   return;
+#elif defined(STRESSAPPTEST_CPU_LOONGARCH)
+  return;
 #else
 #warning "Unsupported CPU type."
 #endif
+}
+
+inline int64 sat_get_time_us() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec * 1000000ULL + ts.tv_nsec/1000ULL;
 }
 
 // Define handy constants here

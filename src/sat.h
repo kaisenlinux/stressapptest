@@ -91,6 +91,7 @@ class Sat {
   int errors() const { return errorcount_; }
   int warm() const { return warm_; }
   bool stop_on_error() const { return stop_on_error_; }
+  bool use_affinity() const { return use_affinity_; }
   int32 region_mask() const { return region_mask_; }
   // Semi-accessor to find the "nth" region to avoid replicated bit searching..
   int32 region_find(int32 num) const {
@@ -136,7 +137,8 @@ class Sat {
   int CpuCount();
   // Return the worst-case (largest) cache line size of the system.
   int CacheLineSize();
-
+  // Read int values from kernel file system e.g. sysfs
+  int ReadInt(const char *filename, int *value);
   // Collect error counts from threads.
   int64 GetTotalErrorCount();
 
@@ -244,6 +246,7 @@ class Sat {
   // Block table for IO device.
   vector<DiskBlockTable*> blocktables_;
 
+  bool use_affinity_;                 // Should stressapptest set cpu affinity?
   int32 region_mask_;                 // Bitmask of available NUMA regions.
   int32 region_count_;                // Count of available NUMA regions.
   int32 region_[32];                  // Pagecount per region.

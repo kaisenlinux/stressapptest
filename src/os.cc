@@ -111,7 +111,6 @@ bool OsLayer::Initialize() {
     num_cpus_per_node_ = num_cpus_ / num_nodes_;
   }
   logprintf(5, "Log: %d nodes, %d cpus.\n", num_nodes_, num_cpus_);
-  sat_assert(CPU_SETSIZE >= num_cpus_);
   cpu_sets_.resize(num_nodes_);
   cpu_sets_valid_.resize(num_nodes_);
   // Create error diagnoser.
@@ -143,7 +142,7 @@ int OsLayer::AddressMode() {
 uint64 OsLayer::VirtualToPhysical(void *vaddr) {
   uint64 frame, paddr, pfnmask, pagemask;
   int pagesize = sysconf(_SC_PAGESIZE);
-  off64_t off = ((uintptr_t)vaddr) / pagesize * 8;
+  off_t off = ((uintptr_t)vaddr) / pagesize * 8;
   int fd = open(kPagemapPath, O_RDONLY);
 
   /*
@@ -155,7 +154,7 @@ uint64 OsLayer::VirtualToPhysical(void *vaddr) {
   if (fd < 0)
     return 0;
 
-  if (lseek64(fd, off, SEEK_SET) != off || read(fd, &frame, 8) != 8) {
+  if (lseek(fd, off, SEEK_SET) != off || read(fd, &frame, 8) != 8) {
     int err = errno;
     string errtxt = ErrorString(err);
     logprintf(0, "Process Error: failed to access %s with errno %d (%s)\n",
@@ -206,11 +205,15 @@ void OsLayer::GetFeatures() {
 #elif defined(STRESSAPPTEST_CPU_PPC)
   // All PPC implementations have cache flush instructions.
   has_clflush_ = true;
-#elif defined(STRESSAPPTEST_CPU_ARMV7A)
+#elif defined(STRESSAPPTEST_CPU_MIPS)
+  // All MIPS implementations have cache flush instructions.
+  has_clflush_ = true;
+#elif defined(STRESSAPPTEST_CPU_ARMV7A) || defined(STRESSAPPTEST_CPU_AARCH64)
   // TODO(nsanders): add detect from /proc/cpuinfo or /proc/self/auxv.
   // For now assume neon and don't run -W if you don't have it.
   has_vector_ = true; // NEON.
-#warning "Unsupported CPU type ARMV7A: unable to determine feature set."
+#elif defined(STRESSAPPTEST_CPU_LOONGARCH)
+  has_clflush_ = true;
 #else
 #warning "Unsupported CPU type: unable to determine feature set."
 #endif
@@ -606,9 +609,9 @@ bool OsLayer::AllocateTestMem(int64 length, uint64 paddr_base) {
         dynamic_mapped_shmem_ = true;
       } else {
         // Do a full mapping here otherwise.
-        shmaddr = mmap64(NULL, length, PROT_READ | PROT_WRITE,
-                         MAP_SHARED | MAP_NORESERVE | MAP_LOCKED | MAP_POPULATE,
-                         shm_object, 0);
+        shmaddr = mmap(NULL, length, PROT_READ | PROT_WRITE,
+                       MAP_SHARED | MAP_NORESERVE | MAP_LOCKED | MAP_POPULATE,
+                       shm_object, 0);
         if (shmaddr == reinterpret_cast<void*>(-1)) {
           int err = errno;
           string errtxt = ErrorString(err);
@@ -703,18 +706,12 @@ void *OsLayer::PrepareTestMem(uint64 offset, uint64 length) {
   if (dynamic_mapped_shmem_) {
     // TODO(nsanders): Check if we can support MAP_NONBLOCK,
     // and evaluate performance hit from not using it.
-#ifdef HAVE_MMAP64
-    void * mapping = mmap64(NULL, length, PROT_READ | PROT_WRITE,
-                     MAP_SHARED | MAP_NORESERVE | MAP_LOCKED | MAP_POPULATE,
-                     shmid_, offset);
-#else
     void * mapping = mmap(NULL, length, PROT_READ | PROT_WRITE,
                      MAP_SHARED | MAP_NORESERVE | MAP_LOCKED | MAP_POPULATE,
                      shmid_, offset);
-#endif
     if (mapping == MAP_FAILED) {
       string errtxt = ErrorString(errno);
-      logprintf(0, "Process Error: PrepareTestMem mmap64(%llx, %llx) failed. "
+      logprintf(0, "Process Error: PrepareTestMem mmap(%llx, %llx) failed. "
                    "error: %s.\n",
                 offset, length, errtxt.c_str());
       sat_assert(0);

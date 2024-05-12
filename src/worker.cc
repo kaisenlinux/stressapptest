@@ -89,7 +89,7 @@ namespace {
     if (retval == -1)
       return false;
     if (errmsg != buf) {
-      strncpy(buf, errmsg, len);
+      strncpy(buf, errmsg, len - 1);
       buf[len - 1] = 0;
     }
     return true;
@@ -117,6 +117,8 @@ struct ErrorRecord {
   uint64 paddr;  // This is the bus address, if available.
   uint64 *tagvaddr;  // This holds the tag value if this data was tagged.
   uint64 tagpaddr;  // This holds the physical address corresponding to the tag.
+  uint32 lastcpu;  // This holds the CPU recorded as probably writing this data.
+  const char *patternname;  // This holds the pattern name of the expected data.
 };
 
 // This is a helper function to create new threads with pthreads.
@@ -128,11 +130,23 @@ static void *ThreadSpawnerGeneric(void *ptr) {
 
 void WorkerStatus::Initialize() {
   sat_assert(0 == pthread_mutex_init(&num_workers_mutex_, NULL));
-  sat_assert(0 == pthread_rwlock_init(&status_rwlock_, NULL));
+
+  pthread_rwlockattr_t attrs;
+  sat_assert(0 == pthread_rwlockattr_init(&attrs));
+#ifdef HAVE_PTHREAD_RWLOCKATTR_SETKIND_NP
+  // Avoid writer lock starvation.
+  sat_assert(0 == pthread_rwlockattr_setkind_np(
+                      &attrs, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP));
+#endif
+  sat_assert(0 == pthread_rwlock_init(&status_rwlock_, &attrs));
+
 #ifdef HAVE_PTHREAD_BARRIERS
   sat_assert(0 == pthread_barrier_init(&pause_barrier_, NULL,
                                        num_workers_ + 1));
+  sat_assert(0 == pthread_rwlock_init(&pause_rwlock_, &attrs));
 #endif
+
+  sat_assert(0 == pthread_rwlockattr_destroy(&attrs));
 }
 
 void WorkerStatus::Destroy() {
@@ -440,10 +454,13 @@ bool WorkerThread::BindToCpus(const cpu_set_t *thread_mask) {
     return false;
   }
 #ifdef HAVE_SCHED_GETAFFINITY
-  return (sched_setaffinity(gettid(), sizeof(*thread_mask), thread_mask) == 0);
-#else
-  return 0;
+  if (sat_->use_affinity()) {
+    return (sched_setaffinity(gettid(), sizeof(*thread_mask), thread_mask) == 0);
+  } else {
+    logprintf(11, "Log: Skipping CPU affinity set.\n");
+  }
 #endif
+  return true;
 }
 
 
@@ -461,6 +478,9 @@ bool WorkerThread::FillPage(struct page_entry *pe) {
     logprintf(0, "Process Error: Fill Page entry null\n");
     return 0;
   }
+
+  // Tag this page as written from the current CPU.
+  pe->lastcpu = sched_getcpu();
 
   // Mask is the bitmask of indexes used by the pattern.
   // It is the pattern size -1. Size is always a power of 2.
@@ -514,6 +534,8 @@ bool FillThread::FillPageRandom(struct page_entry *pe) {
 
   // Choose a random pattern for this block.
   pe->pattern = patternlist_->GetRandomPattern();
+  pe->lastcpu = sched_getcpu();
+
   if (pe->pattern == 0) {
     logprintf(0, "Process Error: Null data pattern\n");
     return 0;
@@ -604,17 +626,19 @@ void WorkerThread::ProcessError(struct ErrorRecord *error,
                                               (error->vaddr), 1);
 
     logprintf(priority,
-              "%s: miscompare on CPU %d(0x%s) at %p(0x%llx:%s): "
-              "read:0x%016llx, reread:0x%016llx expected:0x%016llx\n",
+              "%s: miscompare on CPU %d(<-%d) at %p(0x%llx:%s): "
+              "read:0x%016llx, reread:0x%016llx expected:0x%016llx. '%s'%s.\n",
               message,
               core_id,
-              CurrentCpusFormat().c_str(),
+              error->lastcpu,
               error->vaddr,
               error->paddr,
               dimm_string,
               error->actual,
               error->reread,
-              error->expected);
+              error->expected,
+              (error->patternname) ? error->patternname : "None",
+              (error->reread == error->expected) ? " read error" : "");
   }
 
 
@@ -681,7 +705,8 @@ void FileThread::ProcessError(struct ErrorRecord *error,
             dimm_string,
             error->actual,
             error->reread,
-            error->expected);
+            error->expected,
+            (error->patternname) ? error->patternname : "None");
 
   // Overwrite incorrect data with correct data to prevent
   // future miscompares when this data is reused.
@@ -694,6 +719,7 @@ void FileThread::ProcessError(struct ErrorRecord *error,
 // Print errors on mismatches.
 int WorkerThread::CheckRegion(void *addr,
                               class Pattern *pattern,
+                              uint32 lastcpu,
                               int64 length,
                               int offset,
                               int64 pattern_offset) {
@@ -729,6 +755,8 @@ int WorkerThread::CheckRegion(void *addr,
         recorded[errors].actual = actual;
         recorded[errors].expected = expected;
         recorded[errors].vaddr = &memblock[i];
+        recorded[errors].patternname = pattern->name();
+        recorded[errors].lastcpu = lastcpu;
         errors++;
       } else {
         page_error = true;
@@ -902,6 +930,7 @@ int WorkerThread::CrcCheckPage(struct page_entry *srcpe) {
                 expectedcrc->ToHexString().c_str());
       int errorcount = CheckRegion(memslice,
                                    srcpe->pattern,
+                                   srcpe->lastcpu,
                                    blocksize,
                                    currentblock * blocksize, 0);
       if (errorcount == 0) {
@@ -920,6 +949,7 @@ int WorkerThread::CrcCheckPage(struct page_entry *srcpe) {
     uint64 *memslice = memblock + blocks * blockwords;
     errors += CheckRegion(memslice,
                           srcpe->pattern,
+                          srcpe->lastcpu,
                           leftovers,
                           blocks * blocksize, 0);
   }
@@ -1212,6 +1242,7 @@ int WorkerThread::CrcCopyPage(struct page_entry *dstpe,
                 expectedcrc->ToHexString().c_str());
       int errorcount = CheckRegion(sourcemem,
                                    srcpe->pattern,
+                                   srcpe->lastcpu,
                                    blocksize,
                                    currentblock * blocksize, 0);
       if (errorcount == 0) {
@@ -1226,6 +1257,7 @@ int WorkerThread::CrcCopyPage(struct page_entry *dstpe,
           memcpy(sourcemem, targetmem, blocksize);
           errorcount = CheckRegion(sourcemem,
                                    srcpe->pattern,
+                                   srcpe->lastcpu,
                                    blocksize,
                                    currentblock * blocksize, 0);
           if (errorcount == 0) {
@@ -1240,6 +1272,9 @@ int WorkerThread::CrcCopyPage(struct page_entry *dstpe,
             er.actual = sourcemem[0];
             er.expected = 0xbad00000ull << 32;
             er.vaddr = sourcemem;
+            er.lastcpu = srcpe->lastcpu;
+            logprintf(0, "Process Error: lastCPU %d\n", srcpe->lastcpu);
+            er.patternname = srcpe->pattern->name();
             ProcessError(&er, 0, "Hardware Error");
             errors += 1;
             errorcount_ ++;
@@ -1258,6 +1293,7 @@ int WorkerThread::CrcCopyPage(struct page_entry *dstpe,
 
     errors += CheckRegion(sourcemem,
                           srcpe->pattern,
+                          srcpe->lastcpu,
                           leftovers,
                           blocks * blocksize, 0);
     int leftoverwords = leftovers / wordsize_;
@@ -1268,6 +1304,7 @@ int WorkerThread::CrcCopyPage(struct page_entry *dstpe,
 
   // Update pattern reference to reflect new contents.
   dstpe->pattern = srcpe->pattern;
+  dstpe->lastcpu = sched_getcpu();
 
   // Clean clean clean the errors away.
   if (errors) {
@@ -1282,46 +1319,50 @@ int WorkerThread::CrcCopyPage(struct page_entry *dstpe,
 
 // Invert a block of memory quickly, traversing downwards.
 int InvertThread::InvertPageDown(struct page_entry *srcpe) {
+  const int invert_flush_interval = kCacheLineSize / sizeof(unsigned int);
   const int blocksize = 4096;
   const int blockwords = blocksize / wordsize_;
   int blocks = sat_->page_length() / blocksize;
 
   // Base addresses for memory copy
-  unsigned int *sourcemembase = static_cast<unsigned int *>(srcpe->addr);
+  unsigned int* iter = static_cast<unsigned int *>(srcpe->addr) + (blocks * blockwords);
+  unsigned int* rend = static_cast<unsigned int *>(srcpe->addr);
 
-  for (int currentblock = blocks-1; currentblock >= 0; currentblock--) {
-    unsigned int *sourcemem = sourcemembase + currentblock * blockwords;
-    for (int i = blockwords - 32; i >= 0; i -= 32) {
-      for (int index = i + 31; index >= i; --index) {
-        unsigned int actual = sourcemem[index];
-        sourcemem[index] = ~actual;
-      }
-      OsLayer::FastFlush(&sourcemem[i]);
+  OsLayer::FastFlushSync();
+  while(iter != rend) {
+    for(int i = 0; i < invert_flush_interval; ++i) {
+      --iter;
+      *iter = ~(*iter);
     }
+    OsLayer::FastFlushHint(iter);
   }
-
+  OsLayer::FastFlushSync();
+  srcpe->lastcpu = sched_getcpu();
   return 0;
 }
 
 // Invert a block of memory, traversing upwards.
 int InvertThread::InvertPageUp(struct page_entry *srcpe) {
+  const int invert_flush_interval = kCacheLineSize / sizeof(unsigned int);
   const int blocksize = 4096;
   const int blockwords = blocksize / wordsize_;
   int blocks = sat_->page_length() / blocksize;
 
   // Base addresses for memory copy
-  unsigned int *sourcemembase = static_cast<unsigned int *>(srcpe->addr);
+  unsigned int* iter = static_cast<unsigned int *>(srcpe->addr);
+  unsigned int* end = static_cast<unsigned int *>(srcpe->addr) + (blocks * blockwords);
 
-  for (int currentblock = 0; currentblock < blocks; currentblock++) {
-    unsigned int *sourcemem = sourcemembase + currentblock * blockwords;
-    for (int i = 0; i < blockwords; i += 32) {
-      for (int index = i; index <= i + 31; ++index) {
-        unsigned int actual = sourcemem[index];
-        sourcemem[index] = ~actual;
-      }
-      OsLayer::FastFlush(&sourcemem[i]);
+  OsLayer::FastFlushSync();
+  while(iter != end) {
+    for(int i = 0; i < invert_flush_interval; ++i) {
+      *iter = ~(*iter);
+      ++iter;
     }
+    OsLayer::FastFlushHint(iter - invert_flush_interval);
   }
+  OsLayer::FastFlushSync();
+
+  srcpe->lastcpu = sched_getcpu();
   return 0;
 }
 
@@ -1358,6 +1399,7 @@ int WorkerThread::CrcWarmCopyPage(struct page_entry *dstpe,
                 expectedcrc->ToHexString().c_str());
       int errorcount = CheckRegion(sourcemem,
                                    srcpe->pattern,
+                                   srcpe->lastcpu,
                                    blocksize,
                                    currentblock * blocksize, 0);
       if (errorcount == 0) {
@@ -1372,6 +1414,7 @@ int WorkerThread::CrcWarmCopyPage(struct page_entry *dstpe,
           memcpy(sourcemem, targetmem, blocksize);
           errorcount = CheckRegion(sourcemem,
                                    srcpe->pattern,
+                                   srcpe->lastcpu,
                                    blocksize,
                                    currentblock * blocksize, 0);
           if (errorcount == 0) {
@@ -1386,6 +1429,8 @@ int WorkerThread::CrcWarmCopyPage(struct page_entry *dstpe,
             er.actual = sourcemem[0];
             er.expected = 0xbad;
             er.vaddr = sourcemem;
+            er.lastcpu = srcpe->lastcpu;
+            er.patternname = srcpe->pattern->name();
             ProcessError(&er, 0, "Hardware Error");
             errors ++;
             errorcount_ ++;
@@ -1404,6 +1449,7 @@ int WorkerThread::CrcWarmCopyPage(struct page_entry *dstpe,
 
     errors += CheckRegion(sourcemem,
                           srcpe->pattern,
+                          srcpe->lastcpu,
                           leftovers,
                           blocks * blocksize, 0);
     int leftoverwords = leftovers / wordsize_;
@@ -1414,6 +1460,8 @@ int WorkerThread::CrcWarmCopyPage(struct page_entry *dstpe,
 
   // Update pattern reference to reflect new contents.
   dstpe->pattern = srcpe->pattern;
+  dstpe->lastcpu = sched_getcpu();
+
 
   // Clean clean clean the errors away.
   if (errors) {
@@ -1479,8 +1527,10 @@ bool CopyThread::Work() {
   bool result = true;
   int64 loops = 0;
 
-  logprintf(9, "Log: Starting copy thread %d: cpu %s, mem %x\n",
-            thread_num_, cpuset_format(&cpu_mask_).c_str(), tag_);
+  logprintf(9, "Log: Starting copy thread %d: cpu %s, "
+            "mem %x, warm: %d, has_vector: %d\n",
+            thread_num_, cpuset_format(&cpu_mask_).c_str(), tag_,
+            sat_->warm(), os_->has_vector());
 
   while (IsReadyToRun()) {
     // Pop the needed pages.
@@ -1494,7 +1544,7 @@ bool CopyThread::Work() {
 
     // Force errors for unittests.
     if (sat_->error_injection()) {
-      if (loops == 8) {
+      if ((random() % 50000) == 8) {
         char *addr = reinterpret_cast<char*>(src.addr);
         int offset = random() % sat_->page_length();
         addr[offset] = 0xba;
@@ -1509,6 +1559,7 @@ bool CopyThread::Work() {
     } else {
       memcpy(dst.addr, src.addr, sat_->page_length());
       dst.pattern = src.pattern;
+      dst.lastcpu = sched_getcpu();
     }
 
     result = result && sat_->PutValid(&dst);
@@ -1656,7 +1707,7 @@ bool FileThread::WritePages(int fd) {
   int strict = sat_->strict();
 
   // Start fresh at beginning of file for each batch of pages.
-  lseek64(fd, 0, SEEK_SET);
+  lseek(fd, 0, SEEK_SET);
   for (int i = 0; i < sat_->disk_pages(); i++) {
     struct page_entry src;
     if (!GetValidPage(&src))
@@ -1753,6 +1804,7 @@ bool FileThread::SectorValidatePage(const struct PageRec &page,
                                                   tag[sec].sector,
                                                   page.src, page.dst);
 
+      errorcount_ += 1;
       logprintf(5, "Sector Error: Sector tag @ 0x%x, pass %d/%d. "
                 "sec %x/%x, block %d/%d, magic %x/%x, File: %s \n",
                 block * page_length + 512 * sec,
@@ -1844,6 +1896,7 @@ bool FileThread::GetEmptyPage(struct page_entry *dst) {
     dst->addr = local_page_;
     dst->offset = 0;
     dst->pattern = 0;
+    dst->lastcpu = 0;
   }
   return true;
 }
@@ -1892,13 +1945,14 @@ bool FileThread::ReadPages(int fd) {
   bool result = true;
 
   // Read our data back out of the file, into it's new location.
-  lseek64(fd, 0, SEEK_SET);
+  lseek(fd, 0, SEEK_SET);
   for (int i = 0; i < sat_->disk_pages(); i++) {
     struct page_entry dst;
     if (!GetEmptyPage(&dst))
       return false;
     // Retrieve expected pattern.
     dst.pattern = page_recs_[i].pattern;
+    dst.lastcpu = sched_getcpu();
     // Update page recordpage record.
     page_recs_[i].dst = dst.addr;
 
@@ -2002,7 +2056,7 @@ bool NetworkSlaveThread::IsNetworkStopSet() {
 
 // Set ip name to use for Network IO.
 void NetworkThread::SetIP(const char *ipaddr_init) {
-  strncpy(ipaddr_, ipaddr_init, 256);
+  strncpy(ipaddr_, ipaddr_init, 255);
 }
 
 // Create a socket.
@@ -2230,6 +2284,7 @@ bool NetworkThread::Work() {
 
     // Update pattern reference to reflect new contents.
     dst.pattern = src.pattern;
+    dst.lastcpu = sched_getcpu();
 
     // Do the network read.
     if (!(result = result && ReceivePage(sock, &dst)))
@@ -2480,8 +2535,7 @@ uint64 CpuCacheCoherencyThread::SimpleRandom(uint64 seed) {
 bool CpuCacheCoherencyThread::Work() {
   logprintf(9, "Log: Starting the Cache Coherency thread %d\n",
             cc_thread_num_);
-  uint64 time_start, time_end;
-  struct timeval tv;
+  int64 time_start, time_end;
 
   // Use a slightly more robust random number for the initial
   // value, so the random sequences from the simple generator will
@@ -2496,8 +2550,7 @@ bool CpuCacheCoherencyThread::Work() {
   r |= static_cast<uint64>(rand()) << 32;  // NOLINT
 #endif
 
-  gettimeofday(&tv, NULL);  // Get the timestamp before increments.
-  time_start = tv.tv_sec * 1000000ULL + tv.tv_usec;
+  time_start = sat_get_time_us();
 
   uint64 total_inc = 0;  // Total increments done by the thread.
   while (IsReadyToRun()) {
@@ -2551,10 +2604,9 @@ bool CpuCacheCoherencyThread::Work() {
                 cc_global_num, cc_inc_count_);
     }
   }
-  gettimeofday(&tv, NULL);  // Get the timestamp at the end.
-  time_end = tv.tv_sec * 1000000ULL + tv.tv_usec;
+  time_end = sat_get_time_us();
 
-  uint64 us_elapsed = time_end - time_start;
+  int64 us_elapsed = time_end - time_start;
   // inc_rate is the no. of increments per second.
   double inc_rate = total_inc * 1e6 / us_elapsed;
 
@@ -2805,9 +2857,7 @@ bool DiskThread::CloseDevice(int fd) {
 
 // Return the time in microseconds.
 int64 DiskThread::GetTime() {
-  struct timeval tv;
-  gettimeofday(&tv, NULL);
-  return tv.tv_sec * 1000000 + tv.tv_usec;
+  return sat_get_time_us();
 }
 
 // Do randomized reads and (possibly) writes on a device.
@@ -3105,7 +3155,7 @@ bool DiskThread::ValidateBlockOnDisk(int fd, BlockData *block) {
 
   // Read block from disk and time the read.  If it takes longer than the
   // threshold, complain.
-  if (lseek64(fd, address * kSectorSize, SEEK_SET) == -1) {
+  if (lseek(fd, address * kSectorSize, SEEK_SET) == -1) {
     logprintf(0, "Process Error: Unable to seek to sector %lld in "
               "DiskThread::ValidateSectorsOnDisk on disk %s "
               "(thread %d).\n", address, device_name_.c_str(), thread_num_);
@@ -3149,7 +3199,7 @@ bool DiskThread::ValidateBlockOnDisk(int fd, BlockData *block) {
     // In non-destructive mode, don't compare the block to the pattern since
     // the block was never written to disk in the first place.
     if (!non_destructive_) {
-      if (CheckRegion(block_buffer_, block->pattern(), current_bytes,
+      if (CheckRegion(block_buffer_, block->pattern(), 0, current_bytes,
                       0, bytes_read)) {
         os_->ErrorReport(device_name_.c_str(), "disk-pattern-error", 1);
         errorcount_ += 1;
@@ -3387,6 +3437,7 @@ bool MemoryRegionThread::Work() {
     phase_ = kPhaseCopy;
     CrcCopyPage(&memregion_pe, &source_pe);
     memregion_pe.pattern = source_pe.pattern;
+    memregion_pe.lastcpu = sched_getcpu();
 
     // Error injection for CRC Check.
     if ((sat_->error_injection() || error_injection_) && loops == 2) {
